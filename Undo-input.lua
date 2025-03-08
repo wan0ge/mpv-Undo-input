@@ -304,7 +304,7 @@ local function load_user_key_bindings()
 end
 
 -- 显示属性信息到OSD（优化后的版本）
-local function show_property_osd(property)
+local function show_property_osd(property, action_type, current_value, previous_value)
     if not options.use_native_osd or not property then
         return false
     end
@@ -313,20 +313,27 @@ local function show_property_osd(property)
         return true
     end
     
-    -- 获取属性的实际值
-    local success, value = pcall_native(mp_get_property_native, property)
-    if not success or value == nil then
+    -- 如果当前值和前一个值相同，不显示提示
+    if current_value == previous_value then
+        debug_print("值未发生变化，跳过显示: " .. property)
+        return true
+    end
+    
+    -- 获取当前值(如果未传入)
+    local display_current = current_value or (function()
+        local success, val = pcall_native(mp_get_property_native, property)
+        if success then return val else return nil end
+    end)()
+    
+    if display_current == nil then
         debug_print("获取属性值失败: " .. property)
         return false
     end
     
-    -- 将值转换为适合显示的字符串
-    local display_value = safe_tostring(value)
+    -- 构造提示前缀
+    local prefix = action_type == "undo" and "已撤销 " or "已重置 "
     
     -- 针对不同类型的属性使用不同的显示格式
-    local display_text = ""
-    
-    -- 优化：使用表驱动替代冗长的if-else链
     local property_zh_names = {
         brightness = "亮度",
         contrast = "对比度",
@@ -334,20 +341,52 @@ local function show_property_osd(property)
         saturation = "饱和度",
         hue = "色调",
         volume = "音量",
-        mute = function(val) return "静音: " .. (val and "开启" or "关闭") end,
-        ["sub-visibility"] = function(val) return "字幕可见: " .. (val and "是" or "否") end,
-        ontop = function(val) return "窗口置顶: " .. (val and "开启" or "关闭") end,
-        ["audio-delay"] = function(val) return string_format("音频延迟: %d ms", math_floor(val * 1000)) end,
-        ["sub-delay"] = function(val) return string_format("字幕延迟: %d ms", math_floor(val * 1000)) end
+        mute = function(val) return (val and "开启" or "关闭") end,
+        ["sub-visibility"] = function(val) return (val and "是" or "否") end,
+        ontop = function(val) return (val and "开启" or "关闭") end,
+        ["audio-delay"] = function(val) 
+            -- 确保使用正确的数值计算
+            return string_format("%d ms", math_floor(val * 1000 + 0.5)) -- 添加0.5进行四舍五入
+        end,
+        ["sub-delay"] = function(val) 
+            -- 确保使用正确的数值计算
+            return string_format("%d ms", math_floor(val * 1000 + 0.5)) -- 添加0.5进行四舍五入
+        end
     }
     
     local handler = property_zh_names[property]
+    local display_text = prefix
+    
+    -- 构造显示文本,包含变化过程
     if type(handler) == "function" then
-        display_text = handler(value)
-    elseif type(handler) == "string" then
-        display_text = handler .. ": " .. display_value
+        local prop_name = ""
+        -- 为特定属性添加前缀说明
+        if property == "mute" then
+            prop_name = "静音: "
+        elseif property == "sub-visibility" then
+            prop_name = "字幕可见: "
+        elseif property == "ontop" then
+            prop_name = "窗口置顶: "
+        elseif property == "audio-delay" then
+            prop_name = "音频延迟: "
+        elseif property == "sub-delay" then
+            prop_name = "字幕延迟: "
+        end
+        
+        if previous_value ~= nil then
+            display_text = display_text .. prop_name .. handler(previous_value) .. " → " .. handler(display_current)
+        else
+            display_text = display_text .. prop_name .. handler(display_current)
+        end
     else
-        display_text = property .. ": " .. display_value
+        local prop_name = type(handler) == "string" and handler or property
+        if previous_value ~= nil then
+            display_text = display_text .. prop_name .. ": " .. 
+                         safe_tostring(previous_value) .. " → " .. 
+                         safe_tostring(display_current)
+        else
+            display_text = display_text .. prop_name .. ": " .. safe_tostring(display_current)
+        end
     end
     
     -- 显示到OSD
@@ -424,7 +463,7 @@ local function set_undoing_flag(value)
     state.is_undoing = value
     if value then
         -- 延迟重置撤销标志，确保属性变更完成后才能再次记录操作
-        mp_add_timeout(0.1, function()
+        mp_add_timeout(0.01, function()
             state.is_undoing = false
         end)
     end
@@ -444,57 +483,90 @@ local function undo_last_action()
         debug_print("重置历史索引到最新: " .. state.history_index)
     end
     
-    -- 获取当前操作项
-    local current_action = get_current_history_item()
-    if not current_action then
-        mp_osd_message("无法撤销操作")
-        return
-    end
-    
-    -- 设置撤销标志，防止撤销操作被记录
-    set_undoing_flag(true)
-    
-    -- 简化属性名获取逻辑
-    local property_name = current_action.cmd_info and current_action.cmd_info.property or current_action.property
-    
-    -- 如果找到属性名并有先前值，则尝试恢复
-    if property_name and current_action.previous_value ~= nil then
-        debug_print("恢复属性到操作前的值: " .. property_name .. " = " .. safe_tostring(current_action.previous_value))
+    -- 递归函数用于处理连续撤销
+    local function try_undo()
+        -- 获取当前操作项
+        local current_action = get_current_history_item()
+        if not current_action then
+            mp_osd_message("无法撤销操作")
+            return false
+        end
         
-        local success, err = pcall_native(mp_set_property_native, property_name, current_action.previous_value)
-        if success then
-            -- 尝试使用原生OSD显示
-            if not show_property_osd(property_name) then
-                mp_osd_message("已撤销: " .. property_name .. " = " .. safe_tostring(current_action.previous_value))
+        -- 设置撤销标志，防止撤销操作被记录
+        set_undoing_flag(true)
+        
+        -- 简化属性名获取逻辑
+        local property_name = current_action.cmd_info and current_action.cmd_info.property or current_action.property
+        
+        -- 如果找到属性名并有先前值，则尝试恢复
+        if property_name and current_action.previous_value ~= nil then
+            local current_value = mp_get_property_native(property_name)
+            
+            -- 检查值是否相同
+            if current_value == current_action.previous_value then
+                debug_print("跳过相同值的撤销操作: " .. property_name)
+                -- 从历史记录中删除这条记录
+                table_remove(state.shortcut_history, state.history_index)
+                if state.history_index > #state.shortcut_history then
+                    state.history_index = #state.shortcut_history
+                end
+                
+                -- 递归尝试撤销下一个操作
+                if #state.shortcut_history > 0 then
+                    return try_undo()
+                end
+                return false
             end
             
-            -- 从历史记录中删除当前操作
-            table_remove(state.shortcut_history, state.history_index)
-            debug_print("已从历史记录中删除撤销的操作，剩余历史记录数: " .. #state.shortcut_history)
+            local success, err = pcall_native(mp_set_property_native, property_name, current_action.previous_value)
+            if success then
+                -- 尝试使用原生OSD显示
+                if not show_property_osd(property_name, "undo", current_action.previous_value, current_value) then
+                    mp_osd_message(string_format("已撤销: %s: %s → %s", 
+                        property_name,
+                        safe_tostring(current_value),
+                        safe_tostring(current_action.previous_value)))
+                end
+                
+                -- 从历史记录中删除当前操作
+                table_remove(state.shortcut_history, state.history_index)
+                debug_print("已从历史记录中删除撤销的操作，剩余历史记录数: " .. #state.shortcut_history)
+                
+                -- 更新历史索引，指向下一个可撤销的操作
+                if state.history_index > #state.shortcut_history then
+                    state.history_index = #state.shortcut_history
+                end
+                
+                debug_print("撤销成功，历史索引更新为: " .. state.history_index)
+                return true
+            else
+                debug_print("设置属性失败: " .. (err or "未知错误"))
+                mp_osd_message("撤销失败: " .. property_name)
+                return false
+            end
+        else
+            debug_print("无法撤销操作，没有保存操作前的值")
+            mp_osd_message("无法撤销此操作")
             
-            -- 更新历史索引，指向下一个可撤销的操作
+            -- 无法撤销的操作也从历史记录中移除
+            table_remove(state.shortcut_history, state.history_index)
+            debug_print("已从历史记录中删除无法撤销的操作，剩余历史记录数: " .. #state.shortcut_history)
+            
+            -- 更新历史索引
             if state.history_index > #state.shortcut_history then
                 state.history_index = #state.shortcut_history
             end
             
-            debug_print("撤销成功，历史索引更新为: " .. state.history_index)
-        else
-            debug_print("设置属性失败: " .. (err or "未知错误"))
-            mp_osd_message("撤销失败: " .. property_name)
-        end
-    else
-        debug_print("无法撤销操作，没有保存操作前的值")
-        mp_osd_message("无法撤销此操作")
-        
-        -- 无法撤销的操作也从历史记录中移除
-        table_remove(state.shortcut_history, state.history_index)
-        debug_print("已从历史记录中删除无法撤销的操作，剩余历史记录数: " .. #state.shortcut_history)
-        
-        -- 更新历史索引
-        if state.history_index > #state.shortcut_history then
-            state.history_index = #state.shortcut_history
+            -- 递归尝试撤销下一个操作
+            if #state.shortcut_history > 0 then
+                return try_undo()
+            end
+            return false
         end
     end
+    
+    -- 开始尝试撤销
+    try_undo()
 end
 
 -- 重置当前操作为默认值（修改版 - 重置后删除相关历史记录）
@@ -526,13 +598,15 @@ local function reset_last_action()
     
     -- 如果找到了属性名，尝试重置该属性
     if property_name and state.default_values[property_name] ~= nil then
-        debug_print("重置属性到默认值: " .. property_name .. " = " .. safe_tostring(state.default_values[property_name]))
-        
+        local current_value = mp_get_property_native(property_name)
         local success, err = pcall_native(mp_set_property_native, property_name, state.default_values[property_name])
         if success then
-            -- 尝试使用原生OSD显示
-            if not show_property_osd(property_name) then
-                mp_osd_message("已重置: " .. property_name .. " = " .. safe_tostring(state.default_values[property_name]))
+            -- 使用改进后的 show_property_osd,传入当前值和默认值
+            if not show_property_osd(property_name, "reset", state.default_values[property_name], current_value) then
+                mp_osd_message(string_format("已重置: %s: %s → %s", 
+                    property_name,
+                    safe_tostring(current_value),
+                    safe_tostring(state.default_values[property_name])))
             end
             
             -- 保存当前操作的属性名和快捷键
@@ -587,7 +661,6 @@ local function monitor_properties()
     for i = 1, #common_properties do
         local prop = common_properties[i]
         
-        -- 跳过播放控制相关属性
         if should_ignore_property(prop) then
             goto continue
         end
@@ -599,9 +672,9 @@ local function monitor_properties()
             debug_print("保存属性默认值: " .. prop .. " = " .. safe_tostring(init_value))
         end
         
-        -- 创建一个闭包，保存当前属性名和上一次的值
+        -- 创建闭包保存当前属性名和上一次的值
         local last_value = init_value
-        local property_name = prop  -- 捕获循环变量
+        local property_name = prop
         
         mp_observe_property(prop, "native", function(_, value)
             -- 如果正在撤销操作，跳过记录
@@ -610,26 +683,28 @@ local function monitor_properties()
                 return
             end
             
-            if value ~= nil and value ~= last_value then  -- 只记录有效的变化
-                -- 保存之前的值以便撤销
-                local prev_value = last_value
-                -- 更新当前值为下一次变化的之前值
-                last_value = value
+            -- 记录每一次有效的值变化
+            if value ~= nil and value ~= last_value then
+                debug_print("记录属性变更: " .. property_name .. 
+                          " 从 " .. safe_tostring(last_value) .. 
+                          " 到 " .. safe_tostring(value))
                 
-                -- 记录属性变更和之前的值
-                debug_print("属性变更: " .. property_name .. " 从 " .. safe_tostring(prev_value) .. " 到 " .. safe_tostring(value))
+                -- 记录这次变化
                 add_history_item({
                     property = property_name,
                     value = value,
                     timestamp = os_time(),
-                    previous_value = prev_value
+                    previous_value = last_value
                 })
+                
+                -- 更新last_value为当前值
+                last_value = value
             end
         end)
         
         ::continue::
     end
-end
+end	
 
 -- 监听所有用户定义的快捷键（使用函数闭包优化）
 local function setup_user_key_bindings()
