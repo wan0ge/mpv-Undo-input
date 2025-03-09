@@ -1,5 +1,8 @@
 # mpv-Undo-input
 在mpv中撤销或重置快捷键操作（撤销操作）
+## 预览图片
+![Snipaste_2025-03-09_08-04-19](https://github.com/user-attachments/assets/845f48cc-2e2b-4956-9ec6-d65ec960cede)
+![Snipaste_2025-03-09_08-04-31](https://github.com/user-attachments/assets/64f73793-a56d-432a-b31b-45dfde9e952a)
 
 ## 使用方法
 将.lua文件放入scripts文件夹
