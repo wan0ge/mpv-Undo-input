@@ -9,7 +9,7 @@
 -- 配置选项
 local options = {
     max_history_size = 100,  -- 最大历史记录数
-    debug_mode = true,      -- 是否启用调试输出
+    debug_mode = false,      -- 是否启用调试输出
     undo_key = "Ctrl+Alt+z", -- 撤销快捷键
     reset_key = "ctrl+alt+BS", -- 重置快捷键
     use_native_osd = true    -- 是否使用MPV原生OSD显示撤销信息
